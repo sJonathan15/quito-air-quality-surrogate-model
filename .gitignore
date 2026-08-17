@@ -28,8 +28,16 @@ src/uploads/
 datos_remmaq/
 data/raw/
 
-# Local screenshots not selected for publication
+# Screenshots and image directories
+docs/images/
 local_images/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+
 
 # OS
 .DS_Store
