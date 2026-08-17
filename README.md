@@ -11,7 +11,9 @@ Academic machine learning pipeline for air quality forecasting in Quito using RE
 [![SHAP](https://img.shields.io/badge/Explainability-SHAP-7C3AED)](https://shap.readthedocs.io/)
 ![Academic Project](https://img.shields.io/badge/Status-Research%20Prototype-546E7A)
 
+![Vista principal de Quito Air ML](docs/images/dashboard.png)
 
+*Vista principal de la aplicación desarrollada con NiceGUI.*
 
 ## Sobre el proyecto
 
@@ -62,23 +64,23 @@ Se verificó funcionalmente el procesamiento para Belisario, Carapungo, Centro, 
 
 `script_limpieza_niceGUI.py` proporciona una interfaz independiente para cargar archivos REMMAQ, reconocer variables, evaluar la completitud por parroquia, aplicar reglas de limpieza y generar un dataset CSV consolidado.
 
-
+![Inicio de la aplicación de limpieza](docs/images/Inicio-limpieza.png)
 
 La interfaz acepta una carpeta local o cargas de archivos CSV/XLSX/XLS. Los nombres y la estructura esperados están documentados en [`data/README.md`](data/README.md).
 
-
+![Resultados de la limpieza](docs/images/resultados-limpieza.png)
 
 ## Entrenamiento del modelo
 
 La aplicación predictiva permite cargar el CSV preparado, elegir un contaminante objetivo y entrenar XGBoost con ingeniería de características, selección de variables y validación temporal. El 80 % inicial de los datos se reserva cronológicamente para entrenamiento y el 20 % final para prueba; dentro del entrenamiento se utiliza además un tramo de validación para *early stopping*.
 
-
+![Entrenamiento del modelo](docs/images/entrenamiento.png)
 
 ## Interpretabilidad con SHAP
 
 La opción SHAP genera un Summary Plot global, un Beeswarm Plot y un Waterfall Plot para una predicción individual.
 
-
+![Gráficas de interpretabilidad SHAP](docs/images/graficas3.png)
 
 SHAP describe las contribuciones aprendidas por el modelo; no demuestra causalidad ambiental.
 
@@ -88,7 +90,9 @@ La aplicación sigue este flujo:
 
 `concentración estimada` → `transformación determinística` → `valor y categoría IQCA`
 
-El modelo predice concentración, no IQCA directamente.
+![Panel de predicción e IQCA](docs/images/prediccion.png)
+
+El modelo predice concentración, no IQCA directamente. Los valores visibles en la captura son ilustrativos de la interfaz y no constituyen resultados generales.
 
 ## Resultados del caso piloto
 
@@ -126,7 +130,14 @@ Estos archivos documentan etapas de trabajo; no constituyen *releases* oficiales
 ├── requirements.txt
 ├── data/
 │   └── README.md
-
+├── docs/
+│   └── images/
+│       ├── Inicio-limpieza.png
+│       ├── dashboard.png
+│       ├── entrenamiento.png
+│       ├── graficas3.png
+│       ├── prediccion.png
+│       └── resultados-limpieza.png
 ├── notebooks/
 │   ├── data_preparation/
 │   ├── experiments/
