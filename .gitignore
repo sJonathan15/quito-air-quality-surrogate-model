@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Generated Python models and application artifacts
+*.pkl
+*.joblib
+src/matplotlib_cache/
+src/resultados_surrogate/
+src/uploads/
+
+# REMMAQ raw data
+datos_remmaq/
+data/raw/
+
+# Local screenshots not selected for publication
+local_images/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local publication report
+REPOSITORY_PUBLISH_REPORT.md
