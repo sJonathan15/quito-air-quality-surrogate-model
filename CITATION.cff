@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "Si utiliza este software o partes de su implementación, cite este repositorio y el Trabajo de Titulación asociado."
+type: software
+title: "Quito Air ML: Modelo sustituto para calidad del aire en Quito"
+authors:
+  - family-names: "Cañar Quishpe"
+    given-names: "Jonathan Alexander"
+year: 2026
+url: "https://github.com/sJonathan15/quito-air-quality-surrogate-model"
