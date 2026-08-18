@@ -107,7 +107,7 @@ Los resultados formalmente documentados para Carapungo con PM2.5 son:
 
 Se encuentra disponible un manual de usuario que documenta el flujo completo de operación del proyecto, desde la preparación de los datos REMMAQ hasta el entrenamiento, evaluación, interpretabilidad y predicción mediante el modelo.
 
-👉 [📄 Consultar manual de usuario](docs/manual_de_usuario.pdf)
+👉 [📄 Consultar manual de usuario](manual_de_usuario.pdf)
 
 El manual incluye:
 - Preparación y limpieza de archivos REMMAQ.
@@ -142,18 +142,18 @@ Estos archivos documentan etapas de trabajo; no constituyen *releases* oficiales
 .
 ├── CITATION.cff
 ├── README.md
+├── manual_de_usuario.pdf
 ├── requirements.txt
 ├── data/
 │   └── README.md
 ├── docs/
-│   ├── images/
-│   │   ├── Inicio-limpieza.png
-│   │   ├── dashboard.png
-│   │   ├── entrenamiento.png
-│   │   ├── graficas3.png
-│   │   ├── prediccion.png
-│   │   └── resultados-limpieza.png
-│   └── manual_de_usuario.pdf
+│   └── images/
+│       ├── Inicio-limpieza.png
+│       ├── dashboard.png
+│       ├── entrenamiento.png
+│       ├── graficas3.png
+│       ├── prediccion.png
+│       └── resultados-limpieza.png
 ├── notebooks/
 │   ├── data_preparation/
 │   ├── experiments/
