@@ -104,6 +104,17 @@ CONTAMINANTES_Y = ["PM25", "PM10", "O3", "CO", "NO2", "SO2"]
 METEO_COLS = ["Temperatura", "Humedad", "Viento_Velocidad", "Viento_Direccion", "Precipitacion"]
 MAX_FEATURES_SEL = 40
 
+# ---------------- nuevaV: constantes de interfaz/predicción (no afectan el motor) ---------------- #
+# El target interno del motor de entrenamiento sigue siendo `target_col` tal
+# cual en el original; esta constante solo fija el valor por defecto que la
+# UI usa cuando el selector visible de contaminante se oculta (Fase 6).
+TARGET_DEFAULT = "PM25"
+
+TIMEZONE_APP = "America/Guayaquil"
+HORIZONTE_MAX_HORAS = 48
+N_ANALOGOS_OBJETIVO = 30
+N_ANALOGOS_MINIMO = 10
+
 DEFAULT_ALGORITHM = "XGBoost  (auto GPU/CPU)"
 DEFAULT_TRAIN_RATIO = 0.80
 DEFAULT_K_SPLITS = 5
@@ -189,8 +200,12 @@ def _detectar_timestamp(df: pd.DataFrame) -> str | None:
         return candidatos[0]
     for c in df.columns:
         try:
-            pd.to_datetime(df[c].dropna().astype(str).iloc[:10], infer_datetime_format=True)
-            return c
+            muestra = df[c].dropna().astype(str).iloc[:10]
+            if muestra.empty:
+                continue
+            fechas = pd.to_datetime(muestra, errors="coerce")
+            if fechas.notna().mean() >= 0.8:
+                return c
         except Exception:
             continue
     return None
@@ -229,7 +244,7 @@ def resumen_csv(ruta: str | Path | None) -> dict[str, Any]:
 
 def _preprocesar(df: pd.DataFrame, target_col: str, timestamp_col: str, excluir_pandemia: bool = True) -> pd.DataFrame:
     df = df.copy()
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col], infer_datetime_format=True, errors="coerce")
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
     df = df.dropna(subset=[timestamp_col]).set_index(timestamp_col).sort_index()
     if excluir_pandemia:
         df = df[~df.index.year.isin(ANOS_PANDEMIA)]
@@ -314,41 +329,103 @@ def _crear_lag_lookup(X_train: pd.DataFrame, feat_cols: list[str]) -> dict[str, 
     return lookup
 
 
+# ---------------- Tabla IQCA documentada (Fase 9, última pasada) ----------------
+# FUENTE PRINCIPAL (la misma que documenta la tesis de este proyecto):
+#   Secretaría de Ambiente del Distrito Metropolitano de Quito (2020),
+#   "Índice Quiteño de Calidad del Aire (IQCA)", reproducida y documentada en el
+#   Plan Metropolitano de Desarrollo y Ordenamiento Territorial (PMDOT) del DMQ
+#   2021-2033.
+#
+# RESPALDO DOCUMENTAL SECUNDARIO (corroboración independiente de los mismos
+# puntos de corte, categorías y ventanas de agregación):
+#   - MDMQ (2014, p.34), Secretaría de Ambiente / REMMAQ.
+#   - Universidad Politécnica Salesiana, tesis TTS301, Figura 1, p.9
+#     (dspace.ups.edu.ec/bitstream/123456789/19929/1/UPS%20-%20TTS301.pdf).
+#   - aqihub.info/indices/quito (mismas categorías y ventanas).
+#
+# NOTA (Fase 9): en pasadas anteriores se anotó que la fuente PMDOT "no estaba
+# verificada". Esa anotación se debía únicamente a que el documento no está
+# dentro del repositorio de la aplicación, NO a que la fuente no exista: el
+# PMDOT 2021-2033 es la fuente principal ya documentada en la tesis. Los puntos
+# de corte implementados aquí coinciden con los documentados para el proyecto y
+# NO se rediseñan. No se sustituye por EPA AQI ni se inventan cortes nuevos.
+#
+# Unidades: PM25/PM10/O3/NO2/SO2 en µg/m³; CO se guarda aquí en mg/m³ (la
+# tabla oficial está publicada en µg/m³, se divide /1000) porque la columna
+# CO de dataset_ml_carapungo.csv está en mg/m³.
+#
+# HUECOS DECIMALES ENTRE TRAMOS (Fase 10, última pasada) — ESTADO: SIN REGLA
+# NORMATIVA VERIFICABLE.
+#   La tabla publica los tramos con extremos ENTEROS y no contiguos
+#   (PM25: 0-25 y 26-50; PM10: 0-50 y 51-100; O3: 0-50 y 51-100;
+#    NO2: 0-100 y 101-200; SO2: 0-62.5 y 63.5-125; CO: 0-5.0 y 5.001-10.0).
+#   Por tanto existen intervalos abiertos —(25, 26), (50, 51), (100, 101),
+#   (62.5, 63.5), (5.0, 5.001)— en los que una concentración decimal no cae en
+#   ningún tramo.
+#   Se revisaron las fuentes disponibles para el proyecto y NINGUNA declara si
+#   la concentración debe redondearse, truncarse, o si los tramos deben leerse
+#   como intervalos continuos antes de clasificar. Al no existir una regla
+#   verificable, NO se inventa ninguna: esos valores devuelven None y se
+#   reportan explícitamente como NO_CLASIFICADO.
+#   Prohibido de forma expresa: asignar "Deseable" por defecto, asignar
+#   "Emergencia" por defecto, o adoptar la regla de truncamiento del EPA AQI
+#   (que pertenece a otro índice y a otros puntos de corte).
+#   Casos verificados en auditoria_nuevaV/PRUEBAS_IQCA.csv:
+#     PM25=25.5, PM10=50.5, O3=50.5, NO2=100.5, SO2=63.0, CO=5.0005
+#     -> todos NO_CLASIFICADO (ninguno cae en una categoría por defecto).
 IQCA_BREAKPOINTS: dict[str, list[tuple[float, float, int, int]]] = {
-    "PM25": [(0.0, 12.0, 0, 50), (12.1, 37.4, 51, 100), (37.5, 55.4, 101, 150), (55.5, 150.4, 151, 200), (150.5, 250.4, 201, 300), (250.5, 500.4, 301, 500)],
-    "PM10": [(0, 54, 0, 50), (55, 154, 51, 100), (155, 254, 101, 150), (255, 354, 151, 200), (355, 424, 201, 300), (425, 604, 301, 500)],
-    "O3": [(0, 54, 0, 50), (55, 124, 51, 100), (125, 164, 101, 150), (165, 204, 151, 200), (205, 404, 201, 300), (405, 604, 301, 500)],
-    "CO": [(0.0, 4.4, 0, 50), (4.5, 9.4, 51, 100), (9.5, 12.4, 101, 150), (12.5, 15.4, 151, 200), (15.5, 30.4, 201, 300), (30.5, 50.4, 301, 500)],
-    "NO2": [(0, 53, 0, 50), (54, 100, 51, 100), (101, 360, 101, 150), (361, 649, 151, 200), (650, 1249, 201, 300), (1250, 2049, 301, 500)],
-    "SO2": [(0, 35, 0, 50), (36, 75, 51, 100), (76, 185, 101, 150), (186, 304, 151, 200), (305, 604, 201, 300), (605, 1004, 301, 500)],
+    "PM25": [(0, 25, 0, 50), (26, 50, 51, 100), (51, 150, 101, 200), (151, 250, 201, 300), (251, 350, 301, 400), (351, 1e7, 401, 500)],
+    "PM10": [(0, 50, 0, 50), (51, 100, 51, 100), (101, 250, 101, 200), (251, 400, 201, 300), (401, 500, 301, 400), (501, 1e7, 401, 500)],
+    "O3": [(0, 50, 0, 50), (51, 100, 51, 100), (101, 200, 101, 200), (201, 400, 201, 300), (401, 600, 301, 400), (601, 1e7, 401, 500)],
+    "CO": [(0.0, 5.0, 0, 50), (5.001, 10.0, 51, 100), (10.001, 15.0, 101, 200), (15.001, 30.0, 201, 300), (30.001, 40.0, 301, 400), (40.001, 1e7, 401, 500)],
+    "NO2": [(0, 100, 0, 50), (101, 200, 51, 100), (201, 1000, 101, 200), (1001, 2000, 201, 300), (2001, 3000, 301, 400), (3001, 1e7, 401, 500)],
+    "SO2": [(0, 62.5, 0, 50), (63.5, 125, 51, 100), (126, 200, 101, 200), (201, 1000, 201, 300), (1001, 1800, 301, 400), (1801, 1e7, 401, 500)],
 }
 CATEGORIAS_IQCA = [
     (0, 50, "Deseable", "#10B981"),
     (51, 100, "Aceptable", "#EAB308"),
-    (101, 150, "Precaución", "#F97316"),
-    (151, 200, "Alerta", "#EF4444"),
-    (201, 300, "Alarma", "#A855F7"),
-    (301, 500, "Emergencia", "#111827"),
+    (101, 200, "Precaución", "#F97316"),
+    (201, 300, "Alerta", "#EF4444"),
+    (301, 400, "Alarma", "#A855F7"),
+    (401, 500, "Emergencia", "#111827"),
 ]
+UNIDADES_IQCA = {"PM25": "µg/m³", "PM10": "µg/m³", "O3": "µg/m³", "CO": "mg/m³", "NO2": "µg/m³", "SO2": "µg/m³"}
+
+# Fase 21: ventana de agregación oficial por contaminante (horas). Con una
+# sola estimación puntual horaria, solo NO2 (ventana=1h) admite de forma
+# directa un subíndice IQCA sin promediar.
+IQCA_VENTANA_HORAS: dict[str, int] = {"PM25": 24, "PM10": 24, "O3": 8, "CO": 8, "NO2": 1, "SO2": 24}
+
+NO_CLASIFICADO = ("NO_CLASIFICADO", "#6B7280")
 
 
-def calcular_iqca(contaminante: str, concentracion: float) -> float | None:
+def calcular_iqca(contaminante: str, concentracion: float | None) -> float | None:
+    """Interpola el IQCA puntual dentro de los tramos documentados.
+
+    Sin fallback silencioso: un valor negativo, NaN, o que caiga en uno de los
+    huecos decimales entre tramos (ver nota de Fase 10 sobre IQCA_BREAKPOINTS)
+    devuelve None -> NO_CLASIFICADO en `categoria_iqca`. Nunca 0.0 ("Deseable")
+    ni 500.0 ("Emergencia") por defecto, y nunca la regla de truncamiento del
+    EPA AQI: no existe una regla normativa verificable para esos huecos en las
+    fuentes documentadas del proyecto."""
+    if concentracion is None or (isinstance(concentracion, float) and np.isnan(concentracion)) or concentracion < 0:
+        return None
     bp_list = IQCA_BREAKPOINTS.get(contaminante)
     if bp_list is None:
         return None
     for c_lo, c_hi, i_lo, i_hi in bp_list:
         if c_lo <= concentracion <= c_hi:
             return i_lo + (concentracion - c_lo) * (i_hi - i_lo) / (c_hi - c_lo)
-    if concentracion > bp_list[-1][1]:
-        return 500.0
-    return 0.0
+    return None
 
 
-def categoria_iqca(iqca: float) -> tuple[str, str]:
+def categoria_iqca(iqca: float | None) -> tuple[str, str]:
+    if iqca is None:
+        return NO_CLASIFICADO
     for lo, hi, label, color in CATEGORIAS_IQCA:
         if lo <= iqca <= hi:
             return label, color
-    return "Emergencia", "#111827"
+    return NO_CLASIFICADO
 
 
 def _fig_to_data_uri(fig: plt.Figure) -> str:
@@ -388,6 +465,55 @@ def _fig_prediccion(y_test, y_pred, target_col: str, days: int, parroquia: str =
     plt.yticks(color=TEXT_PLOT, fontsize=9)
     _aplicar_estilo_ax(ax, titulo, "Fecha", target_col)
     ax.legend(framealpha=0.92, facecolor=SURF_PLOT, edgecolor=GRID_PLOT, fontsize=10)
+    plt.tight_layout()
+    return fig
+
+
+# ---------------- Fase 10: Real vs Predicho — MODO 2 y MODO 3 ---------------- #
+# Reutilizan EXACTAMENTE los mismos y_test/y_pred del modelo original
+# (MODO 1 "Superpuesto" es `_fig_prediccion`, sin cambios). No se recalculan
+# ni desplazan datos; solo cambia la forma de visualizarlos.
+
+def _fig_prediccion_paneles(y_test, y_pred, target_col: str, days: int, parroquia: str = ""):
+    df_p = pd.DataFrame({"Real": y_test.values, "Predicho": y_pred}, index=y_test.index)
+    df_p = df_p[df_p.index >= df_p.index.max() - pd.Timedelta(days=days)]
+    titulo = f"Real vs Predicho (paneles) — {target_col} · últimos {days} días"
+    if parroquia:
+        titulo = f"{parroquia} · {titulo}"
+    ymin = min(df_p["Real"].min(), df_p["Predicho"].min())
+    ymax = max(df_p["Real"].max(), df_p["Predicho"].max())
+    pad = (ymax - ymin) * 0.06 if ymax > ymin else 1.0
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6.4), facecolor=BG_PLOT, sharex=True, sharey=True)
+    for ax, serie, color, etiqueta in ((ax1, df_p["Real"], COLOR_REAL, "Real"), (ax2, df_p["Predicho"], COLOR_PRED, "Predicho")):
+        ax.set_facecolor(BG_PLOT)
+        ax.plot(df_p.index, serie, color=color, lw=1.9, alpha=0.95)
+        ax.set_ylim(ymin - pad, ymax + pad)
+        _aplicar_estilo_ax(ax, etiqueta, "", target_col)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax2.xaxis.set_major_locator(mdates.DayLocator())
+    plt.setp(ax2.get_xticklabels(), rotation=28, ha="right", color=TEXT_PLOT, fontsize=9)
+    fig.suptitle(titulo, fontsize=12, fontweight="bold", color=TEXT_PLOT, y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def _fig_prediccion_residuo(y_test, y_pred, target_col: str, days: int, parroquia: str = ""):
+    df_p = pd.DataFrame({"Real": y_test.values, "Predicho": y_pred}, index=y_test.index)
+    df_p = df_p[df_p.index >= df_p.index.max() - pd.Timedelta(days=days)]
+    df_p["Residuo"] = df_p["Real"] - df_p["Predicho"]
+    titulo = f"Residuo (Real − Predicho) — {target_col} · últimos {days} días"
+    if parroquia:
+        titulo = f"{parroquia} · {titulo}"
+    fig, ax = plt.subplots(figsize=(12, 4.4), facecolor=BG_PLOT)
+    ax.set_facecolor(BG_PLOT)
+    colores = [COLOR_POS if v >= 0 else COLOR_NEG for v in df_p["Residuo"]]
+    ax.bar(df_p.index, df_p["Residuo"], width=0.03, color=colores, alpha=0.75)
+    ax.axhline(0, color=TEXT_PLOT, lw=1.2, linestyle="-", alpha=0.75)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.xaxis.set_major_locator(mdates.DayLocator())
+    plt.xticks(rotation=28, ha="right", color=TEXT_PLOT, fontsize=9)
+    plt.yticks(color=TEXT_PLOT, fontsize=9)
+    _aplicar_estilo_ax(ax, titulo, "Fecha", f"Residuo ({target_col})")
     plt.tight_layout()
     return fig
 
@@ -522,16 +648,15 @@ def _fig_r2_comparativo(kf_resumen: pd.DataFrame, target_col: str, parroquia: st
     contams = df["Contaminante"].tolist()
     r2_m = df["R2_mean"].values
     r2_s = df["R2_std"].values
-    colores = ["#10B981" if v >= 0.70 else ("#F59E0B" if v >= 0.50 else "#EF4444") for v in r2_m]
+    # Fase 9: sin umbrales universales de R² (no existe un corte aplicable
+    # por igual a los seis contaminantes) — solo valor, media y dispersión.
     fig, ax = plt.subplots(figsize=(9.8, max(3.4, len(contams) * 0.66)), facecolor=BG_PLOT)
     ax.set_facecolor(BG_PLOT)
-    bars = ax.barh(contams, r2_m, xerr=r2_s, color=colores, alpha=0.90, ecolor="#94A3B8", capsize=4, height=0.58)
+    bars = ax.barh(contams, r2_m, xerr=r2_s, color=COLOR_REAL, alpha=0.90, ecolor="#94A3B8", capsize=4, height=0.58)
     if target_col in contams:
         idx = contams.index(target_col)
         bars[idx].set_edgecolor(COLOR_SEC)
         bars[idx].set_linewidth(2.4)
-    for xv, lbl, col, ls in [(0.5, "Mínimo 0.5", "#F59E0B", ":"), (0.7, "Bueno 0.7", "#10B981", "--"), (0.9, "Excelente 0.9", COLOR_SEC, "-.")]:
-        ax.axvline(xv, color=col, lw=1.0, linestyle=ls, alpha=0.62, label=lbl)
     for i, (v, s) in enumerate(zip(r2_m, r2_s)):
         ax.text(min(v + 0.01, 1.0), i, f"{v:.3f}±{s:.3f}", va="center", color=TEXT_PLOT, fontsize=8.5)
     ax.set_xlim(0, 1.05)
@@ -539,7 +664,6 @@ def _fig_r2_comparativo(kf_resumen: pd.DataFrame, target_col: str, parroquia: st
     if parroquia:
         titulo = f"{parroquia} · {titulo}"
     _aplicar_estilo_ax(ax, titulo, "R²", "")
-    ax.legend(framealpha=0.92, facecolor=SURF_PLOT, edgecolor=GRID_PLOT, fontsize=8.5, loc="lower right")
     plt.tight_layout()
     return fig
 
@@ -735,7 +859,28 @@ def _generar_explicabilidad_shap(
     return {"figs": figs_uri, "elapsed": elapsed}
 
 
-def fig_mapa_monitoreo(df_prep: pd.DataFrame, target_col: str = "PM25"):
+# Fase 2 (última pasada): el estilo cartográfico se fija en "open-street-map",
+# un proveedor de teselas gratuito de Plotly que NO requiere token ni API key.
+# El estilo anterior ("carto-positron") pasó a requerir credencial en las
+# versiones recientes de la librería y el mapa se rellenaba con el texto
+# "API KEY REQUIRED" repetido en cada tesela. No se crean claves ni secretos.
+MAPBOX_STYLE_SIN_TOKEN = "open-street-map"
+
+# Fase 4 (última pasada): posiciones REFERENCIALES de estaciones REMMAQ en
+# Quito. Se usan únicamente para orientar al lector cuando el dataset no trae
+# coordenadas; NO llevan concentración ni IQCA asociados.
+ESTACIONES_REFERENCIALES: list[tuple[str, float, float]] = [
+    ("Carapungo", -0.098000, -78.447000),
+    ("Cotocollao", -0.106000, -78.497000),
+    ("Belisario", -0.180000, -78.490000),
+    ("Centro", -0.220000, -78.510000),
+    ("El Camal", -0.250000, -78.520000),
+    ("Los Chillos", -0.310000, -78.450000),
+    ("Tumbaco", -0.210000, -78.400000),
+]
+
+
+def fig_mapa_monitoreo(df_prep: pd.DataFrame, target_col: str = "PM25", origen: str = ""):
     QUITO_LAT, QUITO_LON = -0.180653, -78.467834
 
     lat_cols = [c for c in df_prep.columns if c.lower() in ("lat", "latitud", "latitude")]
@@ -756,48 +901,55 @@ def fig_mapa_monitoreo(df_prep: pd.DataFrame, target_col: str = "PM25"):
         except Exception:
             puntos = []
 
-    if not puntos:
-        estaciones = [
-            ("Centro", -0.220, -78.510),
-            ("Cotocollao", -0.106, -78.497),
-            ("Belisario", -0.180, -78.490),
-            ("El Camal", -0.250, -78.520),
-            ("Los Chillos", -0.310, -78.450),
-            ("Tumbaco", -0.210, -78.400),
-        ]
+    if puntos:
+        # El CSV SÍ trae coordenadas reales: se conserva la lógica original
+        # (color por categoría IQCA del promedio medido en cada coordenada).
+        def _color_iqca(val):
+            iq = calcular_iqca(target_col, val)
+            if iq is None:
+                return "#6B7280"
+            _, col = categoria_iqca(iq)
+            return col
 
-        media = float(df_prep[target_col].mean()) if target_col in df_prep.columns else 25.0
-        rng = np.random.default_rng(42)
-
-        for name, lat, lon in estaciones:
-            val = float(media * rng.uniform(0.5, 1.6))
-            puntos.append(dict(lat=lat, lon=lon, val=val, name=name))
-
-    def _color_iqca(val):
-        iq = calcular_iqca(target_col, val)
-        if iq is None:
-            return "#6B7280"
-        _, col = categoria_iqca(iq)
-        return col
-
-    lats = [p["lat"] for p in puntos]
-    lons = [p["lon"] for p in puntos]
-    vals = [p["val"] for p in puntos]
-    names = [p["name"] for p in puntos]
-    cols = [_color_iqca(v) for v in vals]
-    iqcas = [calcular_iqca(target_col, v) or 0 for v in vals]
-
-    fig = go.Figure(go.Scattermapbox(
-        lat=lats,
-        lon=lons,
-        mode="markers",
-        marker=dict(size=18, color=cols, opacity=0.85),
-        text=[f"<b>{n}</b><br>{target_col}: {v:.1f}<br>IQCA: {iq:.0f}" for n, v, iq in zip(names, vals, iqcas)],
-        hoverinfo="text",
-    ))
+        vals = [p["val"] for p in puntos]
+        iqcas = [calcular_iqca(target_col, v) for v in vals]
+        fig = go.Figure(go.Scattermapbox(
+            lat=[p["lat"] for p in puntos],
+            lon=[p["lon"] for p in puntos],
+            mode="markers",
+            marker=dict(size=18, color=[_color_iqca(v) for v in vals], opacity=0.85),
+            text=[f"<b>{p['name']}</b><br>{target_col}: {v:.1f}<br>IQCA: {(f'{iq:.0f}' if iq is not None else 'N/D')}"
+                  for p, v, iq in zip(puntos, vals, iqcas)],
+            hoverinfo="text",
+        ))
+        nota = None
+    else:
+        # Fase 4 (última pasada): el dataset NO trae latitud/longitud. Antes se
+        # dibujaban valores SINTÉTICOS (media del CSV × factor aleatorio) y se
+        # coloreaban por IQCA, lo que podía leerse como mediciones reales. Ahora
+        # se muestran SOLO las ubicaciones, con marcador neutro, sin valor y sin
+        # IQCA ficticio. Carapungo se resalta como caso piloto cuando el origen
+        # del dataset permite detectarlo.
+        es_carapungo = "carapungo" in (origen or "").lower()
+        lats, lons, textos, colores, tamanos = [], [], [], [], []
+        for name, lat, lon in ESTACIONES_REFERENCIALES:
+            piloto = es_carapungo and name == "Carapungo"
+            lats.append(lat)
+            lons.append(lon)
+            colores.append("#12303A" if piloto else "#94A3B8")
+            tamanos.append(20 if piloto else 13)
+            etiqueta = f"<b>{name}</b>" + (" · caso piloto" if piloto else "")
+            textos.append(f"{etiqueta}<br>Ubicación referencial<br>Sin medición asociada")
+        fig = go.Figure(go.Scattermapbox(
+            lat=lats, lon=lons, mode="markers",
+            marker=dict(size=tamanos, color=colores, opacity=0.9),
+            text=textos, hoverinfo="text",
+        ))
+        nota = ("Mapa de referencia — sin mediciones en tiempo real. "
+                "Ubicaciones referenciales; no representan valores actuales.")
 
     fig.update_layout(
-        mapbox_style="carto-positron",
+        mapbox_style=MAPBOX_STYLE_SIN_TOKEN,
         mapbox_center=dict(lat=QUITO_LAT, lon=QUITO_LON),
         mapbox_zoom=10,
         margin=dict(l=0, r=0, t=0, b=0),
@@ -805,6 +957,13 @@ def fig_mapa_monitoreo(df_prep: pd.DataFrame, target_col: str = "PM25"):
         height=None,
         autosize=True,
     )
+    if nota:
+        fig.add_annotation(
+            text=nota,
+            xref="paper", yref="paper", x=0.5, y=0.03, showarrow=False,
+            font=dict(size=11, color="#12303A"),
+            bgcolor="rgba(255,255,255,0.90)", bordercolor="#D8E4E7", borderwidth=1, borderpad=4,
+        )
 
     return fig
 
@@ -1020,34 +1179,67 @@ def entrenar_nicegui(csv_path: str, target_col: str, nombre_modelo: str, usar_sh
 
         if not kf_resumen.empty:
             filas_kf = []
+            # Fase 5 (última pasada): se elimina la columna "Estado"
+            # (Bueno/Aceptable/Mejorable con cortes R²>=0.7 / >=0.5). No existe
+            # un umbral universal de R² válido para los seis contaminantes, y no
+            # se sustituye por ningún otro umbral subjetivo.
+            # Fase 6: se añade la columna "Unidad" para que MAE/RMSE no se lean
+            # como magnitudes comparables entre contaminantes.
             for _, row in kf_resumen.iterrows():
-                nivel = "Bueno" if row["R2_mean"] >= 0.7 else ("Aceptable" if row["R2_mean"] >= 0.5 else "Mejorable")
+                unidad_ctm = UNIDADES_IQCA.get(str(row["Contaminante"]), "—")
                 filas_kf.append(
-                    f"| **{row['Contaminante']}** | `{int(row['Features_X'])}` | `{row['MAE_mean']:.3f} ± {row['MAE_std']:.3f}` | `{row['RMSE_mean']:.3f} ± {row['RMSE_std']:.3f}` | `{row['R2_mean']:.3f} ± {row['R2_std']:.3f}` | {nivel} |"
+                    f"| **{row['Contaminante']}** | {unidad_ctm} | `{int(row['Features_X'])}` | `{row['MAE_mean']:.3f} ± {row['MAE_std']:.3f}` | `{row['RMSE_mean']:.3f} ± {row['RMSE_std']:.3f}` | `{row['R2_mean']:.3f} ± {row['R2_std']:.3f}` |"
                 )
             tabla_kf = "\n".join(filas_kf)
         else:
-            tabla_kf = "| — | — | — | — | — | — |"
+            tabla_kf = "| — | — | — | — | — |"
+
+        # Fase 8: R² medio CV multipolutante — media descriptiva de los R²_mean
+        # de TimeSeriesSplit de los contaminantes REALMENTE evaluados. Se
+        # calcula dinámicamente a partir de kf_resumen; no se hardcodea.
+        if not kf_resumen.empty:
+            r2_cv_medio = float(kf_resumen["R2_mean"].mean())
+            n_contaminantes_evaluados = int(kf_resumen.shape[0])
+        else:
+            r2_cv_medio = None
+            n_contaminantes_evaluados = 0
+        n_contaminantes_total = len(CONTAMINANTES_Y)
+
+        # Fase 6 (última pasada): unidad del contaminante objetivo, para que MAE
+        # y RMSE del modelo final no aparezcan como números sin magnitud.
+        unidad_target = UNIDADES_IQCA.get(target_col, "—")
+        target_label_md = TARGET_LABEL_AMIGABLE.get(target_col, target_col)
+        # Fase 8 (última pasada): NO se afirma automáticamente "sin overfitting".
+        # Solo se reporta el ΔR² y, si la diferencia es amplia, se añade una
+        # advertencia; la conclusión queda en manos de quien lee las métricas.
+        aviso_gap = (
+            f" **Aviso:** la diferencia Train–Test es amplia (ΔR² = `{gap:.3f}` > 0.15); revisar con atención."
+            if gap > 0.15 else ""
+        )
 
         metricas_md = f"""
 ## Surrogate Model — {parroquia}
 
 ### TimeSeriesSplit K={DEFAULT_K_SPLITS}
 
-| Contaminante | Features X | MAE | RMSE | R² | Estado |
-|:------------:|:----------:|:---:|:----:|:--:|:------:|
+| Contaminante | Unidad | Features X | MAE | RMSE | R² |
+|:------------:|:------:|:----------:|:---:|:----:|:--:|
 {tabla_kf}
+
+*Los errores absolutos (MAE / RMSE) están expresados en la unidad de cada contaminante y no deben compararse directamente entre contaminantes con diferentes unidades y escalas.*
+
+{f"**R² medio CV multipolutante:** `{r2_cv_medio:.3f}` · Contaminantes evaluados: `{n_contaminantes_evaluados}/{n_contaminantes_total}`  " if r2_cv_medio is not None else ""}
+*Promedio descriptivo del R² obtenido para los contaminantes evaluados. No representa un porcentaje de aciertos ni el desempeño de un único modelo multisalida.*
 
 ### Modelo final — `{target_col}`
 
-| Métrica | Train | Test ciego |
-|---------|:-----:|:----------:|
-| **MAE** | `{m_tr['MAE']:.4f}` | `{m_te['MAE']:.4f}` |
-| **RMSE** | `{m_tr['RMSE']:.4f}` | `{m_te['RMSE']:.4f}` |
-| **R²** | `{m_tr['R2']:.4f}` | `{m_te['R2']:.4f}` |
-| **Precisión (R² %)** | `{m_tr['R2']*100:.2f}%` | `{m_te['R2']*100:.2f}%` |
+| Métrica | Unidad | Train | Test ciego |
+|---------|:------:|:-----:|:----------:|
+| **MAE — {target_label_md}** | {unidad_target} | `{m_tr['MAE']:.4f}` | `{m_te['MAE']:.4f}` |
+| **RMSE — {target_label_md}** | {unidad_target} | `{m_tr['RMSE']:.4f}` | `{m_te['RMSE']:.4f}` |
+| **R²** | adimensional | `{m_tr['R2']:.4f}` | `{m_te['R2']:.4f}` |
 
-{f"**Aviso:** posible overfitting, ΔR² = `{gap:.3f}`" if gap > 0.15 else "Sin señales fuertes de overfitting."}
+**ΔR² Train–Test = `{gap:.3f}`.** Interpretar conjuntamente con TimeSeriesSplit, MAE y RMSE.{aviso_gap}
 """
 
         perm = permutation_importance(modelo_final, X_te_sc, y_te.values, n_repeats=8, random_state=42, scoring="r2")
@@ -1074,6 +1266,24 @@ def entrenar_nicegui(csv_path: str, target_col: str, nombre_modelo: str, usar_sh
             "ultimo_timestamp": ultimo_timestamp,
         })
 
+        # Fase 23-29 (predicción/IQCA, no entrenamiento): tabla compacta de
+        # histórico REAL de entrenamiento (X_tr + y) para la búsqueda de
+        # "históricos análogos" en predecir_detalle. No crea otro predictor
+        # ni combina con la salida de XGBoost; es solo contexto de entrada.
+        try:
+            cols_hist = [c for c in METEO_COLS if c in X_tr.columns]
+            hist_df = X_tr[cols_hist].copy()
+            hist_df["hora"] = X_tr.index.hour
+            hist_df["mes"] = X_tr.index.month
+            hist_df["dia_semana"] = X_tr.index.weekday
+            hist_df[target_col] = y_tr.values
+            SESION["historico_analogos"] = hist_df.dropna()
+            SESION["historico_target_col"] = target_col
+        except Exception as exc_hist:
+            log.warning("No se pudo construir histórico de análogos: %s", exc_hist)
+            SESION["historico_analogos"] = None
+            SESION["historico_target_col"] = target_col
+
         # Bloque de interpretabilidad SHAP (opcional)
         shap_figs: dict[str, str | None] = {"shap_summary": None, "shap_beeswarm": None, "shap_waterfall": None}
         if usar_shap:
@@ -1094,6 +1304,10 @@ def entrenar_nicegui(csv_path: str, target_col: str, nombre_modelo: str, usar_sh
         figs = {
             "mae": _fig_to_data_uri(_fig_mae_comparativo(kf_resumen, target_col, parroquia)) if not kf_resumen.empty else None,
             "pred": _fig_to_data_uri(_fig_prediccion(y_te_series, y_pred_te, target_col, DEFAULT_PLOT_DAYS, parroquia)),
+            # Fase 10 — MODO 2 "Paneles separados" y MODO 3 "Residuo": mismos
+            # y_te_series/y_pred_te, sin recalcular ni desplazar datos.
+            "pred_paneles": _fig_to_data_uri(_fig_prediccion_paneles(y_te_series, y_pred_te, target_col, DEFAULT_PLOT_DAYS, parroquia)),
+            "pred_residuo": _fig_to_data_uri(_fig_prediccion_residuo(y_te_series, y_pred_te, target_col, DEFAULT_PLOT_DAYS, parroquia)),
             "lc": _fig_to_data_uri(_fig_curva_aprendizaje(kf_curvas.get(target_col, {}), target_col, algoritmo, parroquia, DEFAULT_K_SPLITS)),
             "r2": _fig_to_data_uri(_fig_r2_comparativo(kf_resumen, target_col, parroquia)) if not kf_resumen.empty else None,
             "fi": _fig_to_data_uri(_fig_feature_importance(fi_df, target_col, parroquia)),
@@ -1109,7 +1323,16 @@ def entrenar_nicegui(csv_path: str, target_col: str, nombre_modelo: str, usar_sh
             "metricas_md": metricas_md,
             "logs": "\n".join(logs[-80:]),
             "figures": figs,
-            "kpis": {"r2": f"{m_te['R2']:.3f}", "mae": f"{m_te['MAE']:.3f}", "estado": "Completado", "model_file": pkl_path.name},
+            "kpis": {
+                "r2": f"{m_te['R2']:.3f}",
+                "mae": f"{m_te['MAE']:.3f} {unidad_target}",
+                "mae_label": f"MAE — {target_label_md}",
+                "estado": "Completado",
+                "model_file": pkl_path.name,
+                "r2_cv_medio": f"{r2_cv_medio:.3f}" if r2_cv_medio is not None else "—",
+                "n_contaminantes_evaluados": n_contaminantes_evaluados,
+                "n_contaminantes_total": n_contaminantes_total,
+            },
         }
     except ImportError as e:
         logs.append(f"ERROR: {e}")
@@ -1117,6 +1340,102 @@ def entrenar_nicegui(csv_path: str, target_col: str, nombre_modelo: str, usar_sh
     except Exception:
         logs.append("ERROR: excepción inesperada")
         return fail_payload(f"### Error\n```\n{traceback.format_exc()}\n```")
+
+
+TARGET_LABEL_AMIGABLE = {"PM25": "PM2.5", "PM10": "PM10", "O3": "O3", "CO": "CO", "NO2": "NO2", "SO2": "SO2"}
+
+_FILLER_TOKENS_UBICACION = {"dataset", "data", "ml", "csv", "final", "v1", "v2", "v3", "clean", "limpio"}
+
+
+def _ubicacion_amigable(parroquia_raw: str) -> str:
+    """Fase 34 — heurística de metadata/UI para mostrar la ubicación a partir
+    del nombre de archivo ya derivado en `entrenar_nicegui` (no altera esa
+    lógica de entrenamiento; solo mejora cómo se presenta en pantalla)."""
+    if not parroquia_raw:
+        return "Sin identificar"
+    tokens = [t for t in re.split(r"\s+", parroquia_raw.strip()) if t]
+    utiles = [t for t in tokens if t.lower() not in _FILLER_TOKENS_UBICACION]
+    return " ".join(utiles) if utiles else parroquia_raw
+
+
+def _distancia_circular_normalizada(a: np.ndarray, b: float, escala: float = 360.0) -> np.ndarray:
+    """Distancia circular (Fase 25): 359° y 1° deben quedar cerca, no a 358°."""
+    dif = np.abs(a - b) % escala
+    return np.minimum(dif, escala - dif) / (escala / 2.0)
+
+
+def _buscar_historicos_analogos(historico: pd.DataFrame | None, ts: pd.Timestamp, meteo_vals: dict[str, float]) -> dict[str, Any]:
+    """Fases 24-26: busca en el histórico REAL de entrenamiento las
+    observaciones más semejantes a (hora, mes, meteorología) usando una
+    distancia normalizada simple y auditable (sin modelo de IA adicional).
+    No se optimiza el tamaño de la vecindad contra el test; N es fijo."""
+    if historico is None or historico.empty:
+        return {"subset": None, "n": 0, "metodo": "sin_historico_disponible"}
+    hora, mes = int(ts.hour), int(ts.month)
+    df = historico
+    componentes = []
+    for col in ("Temperatura", "Humedad", "Viento_Velocidad", "Precipitacion"):
+        if col in df.columns and col in meteo_vals:
+            std = float(df[col].std())
+            std = std if std and std > 1e-6 else 1.0
+            componentes.append(((df[col].values - float(meteo_vals[col])) / std) ** 2)
+    if "Viento_Direccion" in df.columns and "Viento_Direccion" in meteo_vals:
+        componentes.append((1.3 * _distancia_circular_normalizada(df["Viento_Direccion"].values, float(meteo_vals["Viento_Direccion"]))) ** 2)
+    if "hora" in df.columns:
+        componentes.append((1.6 * _distancia_circular_normalizada(df["hora"].values.astype(float), float(hora), escala=24.0)) ** 2)
+    if "mes" in df.columns:
+        componentes.append((1.3 * _distancia_circular_normalizada(df["mes"].values.astype(float), float(mes), escala=12.0)) ** 2)
+    if not componentes:
+        return {"subset": None, "n": 0, "metodo": "sin_variables_comparables"}
+    distancia = np.sqrt(np.sum(componentes, axis=0))
+    n_usar = min(N_ANALOGOS_OBJETIVO, len(df))
+    idx_top = np.argsort(distancia)[:n_usar]
+    subset = df.iloc[idx_top]
+    metodo = "distancia_meteo_hora_mes" if len(subset) >= N_ANALOGOS_MINIMO else "distancia_meteo_hora_mes_pocos_casos"
+    return {"subset": subset, "n": len(subset), "metodo": metodo}
+
+
+def _disponibilidad_antecedentes(n: int) -> str:
+    if n >= N_ANALOGOS_OBJETIVO:
+        return "Alta"
+    if n >= N_ANALOGOS_MINIMO:
+        return "Media"
+    return "Baja"
+
+
+def _rango_orientativo(valores: pd.Series) -> tuple[float, float] | None:
+    """Fase 28: P10-P90 de los análogos (regla fija, documentada aquí)."""
+    valores = valores.dropna()
+    if valores.empty:
+        return None
+    return float(valores.quantile(0.10)), float(valores.quantile(0.90))
+
+
+def _ventana_orientativa(historico: pd.DataFrame | None, target_col: str, ts: pd.Timestamp, pred_puntual: float, ventana_horas: int, cobertura_minima: float = 0.75) -> dict[str, Any]:
+    """Fase 31: reconstruye un perfil de referencia para las `ventana_horas`
+    horas que terminan en `ts` usando climatología hora×mes del histórico de
+    entrenamiento (mismo mecanismo que `_crear_lag_lookup`, aplicado al
+    target), y sustituye la propia hora objetivo por la predicción puntual
+    de XGBoost. NO es un IQCA oficial de ventana; es un promedio orientativo.
+    """
+    if ventana_horas <= 1:
+        return {"promedio": float(pred_puntual), "n_horas": 1, "ok": True}
+    if historico is None or historico.empty or target_col not in historico.columns:
+        return {"promedio": None, "n_horas": 0, "ok": False}
+    clima = historico.groupby(["hora", "mes"])[target_col].mean()
+    valores: list[float] = []
+    for k in range(ventana_horas):
+        t_k = ts - pd.Timedelta(hours=k)
+        if k == 0:
+            valores.append(float(pred_puntual))
+            continue
+        v = clima.get((int(t_k.hour), int(t_k.month)))
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            valores.append(float(v))
+    n_horas = len(valores)
+    if n_horas < max(2, int(round(ventana_horas * cobertura_minima))):
+        return {"promedio": None, "n_horas": n_horas, "ok": False}
+    return {"promedio": float(np.mean(valores)), "n_horas": n_horas, "ok": True}
 
 
 def predecir_detalle(fecha_hora, temperatura, humedad, viento_vel, viento_dir, precipitacion) -> dict[str, Any]:
@@ -1144,13 +1463,53 @@ def predecir_detalle(fecha_hora, temperatura, humedad, viento_vel, viento_dir, p
             ts = pd.Timestamp(str(fecha_hora))
         except Exception:
             return {"ok": False, "markdown": f"Formato inválido: `{fecha_hora}`. Usa `YYYY-MM-DD HH:MM`.", "categoria": "Fecha inválida", "iqca": None, "color": "#EF4444", "pred": None}
+
+        # Fase 16: horizonte operativo de 48h en America/Guayaquil (rechaza
+        # fechas pasadas o que excedan +48h; no altera el motor de predicción).
+        try:
+            ts_local = ts.tz_localize(TIMEZONE_APP)
+        except Exception:
+            ts_local = ts.tz_localize(TIMEZONE_APP, ambiguous=True, nonexistent="shift_forward")
+        ahora_local = pd.Timestamp.now(tz=TIMEZONE_APP)
+        limite_max = ahora_local + pd.Timedelta(hours=HORIZONTE_MAX_HORAS)
+        if ts_local < ahora_local - pd.Timedelta(minutes=1):
+            return {
+                "ok": False,
+                "markdown": (
+                    "### Fuera del horizonte operativo\n\n"
+                    f"La fecha/hora seleccionada (`{ts.strftime('%Y-%m-%d %H:%M')}`) ya pasó respecto a la hora "
+                    f"actual en Ecuador (`{ahora_local.strftime('%Y-%m-%d %H:%M')}`).\n\n"
+                    "**Horizonte operativo de la interfaz: máximo 48 horas.** Selecciona un instante entre ahora y +48h."
+                ),
+                "categoria": "Fuera de horizonte", "iqca": None, "color": "#EF4444", "pred": None,
+            }
+        if ts_local > limite_max:
+            return {
+                "ok": False,
+                "markdown": (
+                    "### Fuera del horizonte operativo\n\n"
+                    f"La fecha/hora seleccionada (`{ts.strftime('%Y-%m-%d %H:%M')}`) supera el horizonte operativo de la interfaz "
+                    f"(máximo {HORIZONTE_MAX_HORAS} horas desde ahora, `{ahora_local.strftime('%Y-%m-%d %H:%M')}`).\n\n"
+                    "El límite reduce extrapolaciones temporales excesivas y está orientado a escenarios meteorológicos de corto plazo."
+                ),
+                "categoria": "Fuera de horizonte", "iqca": None, "color": "#EF4444", "pred": None,
+            }
+
         hora, mes = ts.hour, ts.month
         ultimo = SESION.get("ultimo_timestamp")
         advertencia = ""
         if ultimo is not None:
             delta_h = (ts - ultimo).total_seconds() / 3600
             if delta_h > 48:
-                advertencia = f"\n\nAviso: extrapolación de {delta_h:.0f}h después del último dato ({ultimo.strftime('%Y-%m-%d %H:%M')})."
+                # Fase 13 (última pasada): mensaje comprensible para un usuario
+                # no técnico. El detalle numérico (horas de diferencia) pasa a
+                # una línea secundaria de detalle técnico.
+                advertencia = (
+                    "\n\n> **Aviso:** el instante consultado es posterior al período histórico disponible "
+                    f"en el dataset. Último registro utilizado: `{ultimo.strftime('%Y-%m-%d %H:%M')}`. "
+                    "El resultado debe interpretarse como una estimación orientativa.\n>\n"
+                    f"> <sub>Detalle técnico: diferencia de {delta_h:.0f} h respecto al último dato de entrenamiento.</sub>"
+                )
         ciclicas = {"hora_sin": float(np.sin(2 * np.pi * hora / 24)), "hora_cos": float(np.cos(2 * np.pi * hora / 24)), "mes_sin": float(np.sin(2 * np.pi * mes / 12)), "mes_cos": float(np.cos(2 * np.pi * mes / 12))}
         feat_cols = SESION["feat_cols"]
         feat_stats = SESION["feat_stats"]
@@ -1167,6 +1526,13 @@ def predecir_detalle(fecha_hora, temperatura, humedad, viento_vel, viento_dir, p
             "dia_semana_cos": float(np.cos(2 * np.pi * ts.weekday() / 7)),
             "es_finde": float(1 if ts.weekday() >= 5 else 0),
         }
+        # Fase 24-26: histórico análogos como método PRIMARIO de contexto de
+        # entrada; lag_lookup (hora+mes) es el FALLBACK original si no hay
+        # históricos suficientes o la columna no aplica.
+        historico = SESION.get("historico_analogos")
+        analogos = _buscar_historicos_analogos(historico, ts, meteo_vals)
+        subset_analogos = analogos["subset"]
+
         row: dict[str, float] = {}
         for col in feat_cols:
             if col in meteo_vals:
@@ -1175,6 +1541,8 @@ def predecir_detalle(fecha_hora, temperatura, humedad, viento_vel, viento_dir, p
                 row[col] = ciclicas[col]
             elif col in derivadas:
                 row[col] = derivadas[col]
+            elif subset_analogos is not None and col in subset_analogos.columns and subset_analogos[col].notna().any():
+                row[col] = float(subset_analogos[col].mean())
             elif col in lag_lookup and (hora, mes) in lag_lookup[col]:
                 row[col] = lag_lookup[col][(hora, mes)]
             else:
@@ -1182,27 +1550,81 @@ def predecir_detalle(fecha_hora, temperatura, humedad, viento_vel, viento_dir, p
         X_input = pd.DataFrame([row])[feat_cols]
         scaler = SESION["scaler"]
         X_sc = scaler.transform(X_input) if scaler else X_input.values
+
+        # Fase 27: la concentración estimada proviene ÚNICAMENTE de
+        # modelo.predict(...), como en el original. Los históricos análogos
+        # NO se mezclan con esta salida.
         pred = float(SESION["modelo"].predict(X_sc)[0])
         target = SESION["target"]
         parroquia = SESION["parroquia"]
-        iqca_val = calcular_iqca(target, pred)
-        if iqca_val is not None:
-            cat_label, color = categoria_iqca(iqca_val)
-            iqca_line = f"IQCA: `{iqca_val:.1f} / 500` · Categoría: **{cat_label}**"
+        ubicacion = _ubicacion_amigable(parroquia)
+        target_label = TARGET_LABEL_AMIGABLE.get(target, target)
+        unidad = UNIDADES_IQCA.get(target, "")
+
+        # Fase 28-29: rango histórico orientativo + antecedentes.
+        n_antecedentes = analogos["n"]
+        disponibilidad = _disponibilidad_antecedentes(n_antecedentes)
+        rango = _rango_orientativo(subset_analogos[target]) if (subset_analogos is not None and target in subset_analogos.columns) else None
+
+        # Fase 31: promedio orientativo sobre la ventana normativa del
+        # contaminante (24h para PM2.5/PM10/SO2, 8h para O3/CO, 1h para NO2).
+        ventana_horas = IQCA_VENTANA_HORAS.get(target, 24)
+        ventana_res = _ventana_orientativa(historico, target, ts, pred, ventana_horas)
+
+        # Fase 30/32: referencia IQCA coherente con el target único vigente
+        # (PM2.5 por defecto). Se usa el promedio de ventana cuando es
+        # calculable (más riguroso); si no, se declara explícitamente NO
+        # calculable en vez de forzar un número con una sola lectura puntual.
+        # Fase 10 (última pasada): `calcular_iqca` puede devolver None aunque la
+        # ventana SÍ sea calculable, cuando el promedio cae en uno de los huecos
+        # decimales entre tramos de la tabla IQCA (p. ej. PM2.5 = 25.5). Antes
+        # `iqca_disponible` se ponía a True solo por tener ventana y el formateo
+        # posterior reventaba con TypeError (NoneType.__format__), dejando la
+        # pestaña de predicción en "Error". Ahora se distinguen los TRES estados:
+        # ventana insuficiente / concentración no clasificable / IQCA disponible.
+        ventana_calculable = bool(ventana_res["ok"])
+        iqca_val = calcular_iqca(target, ventana_res["promedio"]) if ventana_calculable else None
+        iqca_disponible = iqca_val is not None
+        cat_label, color = categoria_iqca(iqca_val)
+
+        rango_txt = f"{rango[0]:.1f} – {rango[1]:.1f} {unidad}" if rango else "No disponible (sin antecedentes suficientes)"
+        ventana_txt = f"`{ventana_res['promedio']:.2f} {unidad}` · construido con {ventana_res['n_horas']}/{ventana_horas} horas de contexto" if ventana_calculable else "No se dispone de contexto histórico suficiente para estimar una referencia IQCA de ventana."
+        if iqca_disponible:
+            iqca_txt = f"`{iqca_val:.1f} / 500` · Categoría orientativa: **{cat_label}**"
+        elif ventana_calculable:
+            iqca_txt = (
+                f"**NO CLASIFICADO** — el promedio de {ventana_horas}h "
+                f"(`{ventana_res['promedio']:.2f} {unidad}`) cae en un intervalo no cubierto por la tabla IQCA "
+                "documentada. No se asigna ninguna categoría por defecto."
+            )
         else:
-            cat_label, color = "N/D", "#64748B"
-            iqca_line = f"IQCA no disponible para {target}"
-        n_lookup = sum(1 for col in feat_cols if col in lag_lookup and (hora, mes) in lag_lookup.get(col, {}))
-        markdown = (
-            f"### Predicción IQCA — `{target}` · {parroquia}\n\n"
-            f"| Campo | Valor |\n|-------|-------|\n"
-            f"| Fecha / Hora | `{ts.strftime('%Y-%m-%d %H:%M')}` |\n"
-            f"| {target} estimado | `{pred:.3f}` |\n"
-            f"| Resultado | {iqca_line} |\n"
-            f"| Lags imputados | `{n_lookup}` desde tabla climatológica |\n"
-            f"{advertencia}"
-        )
-        return {"ok": True, "markdown": markdown, "categoria": cat_label, "iqca": iqca_val, "color": color, "pred": pred}
+            iqca_txt = "No se dispone de contexto histórico suficiente para estimar una referencia IQCA de {}h.".format(ventana_horas)
+
+        markdown = f"""### Predicción orientativa — {target_label} · {ubicacion}
+
+| Campo | Valor |
+|-------|-------|
+| Ubicación | {ubicacion} |
+| Fecha / Hora | `{ts.strftime('%Y-%m-%d %H:%M')}` (America/Guayaquil) |
+| Contaminante de referencia | {target_label} |
+| Concentración estimada | `{pred:.2f} {unidad}` |
+| Rango histórico orientativo | {rango_txt} |
+| Antecedentes históricos similares utilizados | `{n_antecedentes}` (disponibilidad: {disponibilidad}) |
+| Promedio orientativo {ventana_horas}h | {ventana_txt} |
+| Referencia IQCA orientativa ({target_label}) | {iqca_txt} |
+
+**Nota:** resultado orientativo. La concentración es una estimación del modelo XGBoost, no una medición real. Los antecedentes históricos solo aportan contexto de entrada y un rango de variabilidad — no se combinan con la salida del modelo. La referencia IQCA no constituye una validación operacional.
+{advertencia}"""
+        return {
+            "ok": True,
+            "markdown": markdown,
+            "categoria": cat_label,
+            "iqca": iqca_val,
+            "color": color,
+            "pred": pred,
+            "n_antecedentes": n_antecedentes,
+            "disponibilidad": disponibilidad,
+        }
     except Exception:
         return {"ok": False, "markdown": f"Error:\n```\n{traceback.format_exc()}\n```", "categoria": "Error", "iqca": None, "color": "#EF4444", "pred": None}
 
@@ -1245,7 +1667,8 @@ body.body--light { background: #eef7f6; color: var(--ink); }
 .upload-box .q-uploader__header { background: linear-gradient(90deg, #0f766e, #14b8a6); }
 .upload-box .q-uploader--uploading { animation: uploadPulse 1.15s ease-in-out infinite; }
 @keyframes uploadPulse { 0%,100% { box-shadow: 0 0 0 rgba(20,184,166,0); } 50% { box-shadow: 0 0 0 8px rgba(20,184,166,.16); } }
-.result-band { height: 14px; border-radius: 999px; background: linear-gradient(90deg,#10B981 0 10%,#EAB308 10% 20%,#F97316 20% 30%,#EF4444 30% 40%,#A855F7 40% 60%,#111827 60% 100%); overflow: hidden; }
+/* Fase 19: cortes 0-50/100/200/300/400/500 (nueva tabla IQCA documentada) */
+.result-band { height: 14px; border-radius: 999px; background: linear-gradient(90deg,#10B981 0 10%,#EAB308 10% 20%,#F97316 20% 40%,#EF4444 40% 60%,#A855F7 60% 80%,#111827 80% 100%); overflow: hidden; }
 .log-box { background: #0d2f2b; color: #dffcf8; border-radius: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 210px; overflow: auto; white-space: pre-wrap; }
 .plot-img { width: 100%; border-radius: 18px; border: 1px solid var(--line); background: white; }
 .q-tab { border-radius: 14px; }
@@ -1393,7 +1816,10 @@ def build_app() -> None:
     ui.add_head_html(f"<style>{APP_CSS}</style>")
     ui.colors(primary="#0f766e", secondary="#14b8a6", accent="#f59e0b", positive="#10b981")
 
-    state: dict[str, Any] = {"csv_path": None}
+    # Fase 11 (última pasada): "training" es un cerrojo de UI. La comprobación
+    # y el marcado ocurren sin ningún `await` intermedio, por lo que dos eventos
+    # de click no pueden entrar a la vez en el bucle de asyncio.
+    state: dict[str, Any] = {"csv_path": None, "training": False}
 
     # Sidebar
     with ui.left_drawer(value=True).props("show-if-above bordered").classes("p-4"):
@@ -1409,7 +1835,7 @@ def build_app() -> None:
             ("dashboard", "dashboard", "Dashboard"),
             ("train", "model_training", "Entrenamiento"),
             ("metrics", "analytics", "Métricas"),
-            ("predict", "tips_and_updates", "Predicción"),
+            ("predict", "tips_and_updates", "Predicción IQCA orientativa"),
         ]
         nav_buttons = []
         for tab_name, icon, label in nav_items:
@@ -1440,7 +1866,7 @@ def build_app() -> None:
             ui.tab("dashboard", label="Dashboard", icon="dashboard")
             ui.tab("train", label="Entrenamiento", icon="model_training")
             ui.tab("metrics", label="Métricas", icon="analytics")
-            ui.tab("predict", label="Predicción IQCA", icon="tips_and_updates")
+            ui.tab("predict", label="Predicción IQCA orientativa", icon="tips_and_updates")
 
         def go(tab_name: str):
             tabs.set_value(tab_name)
@@ -1456,15 +1882,19 @@ def build_app() -> None:
                     with ui.column().classes("w-full lg:w-[320px] gap-5 flex-shrink-0"):
                         # Gauge IQCA promedio
                         with ui.element("div").classes("dash-gauge-card w-full"):
-                            ui.label("Promedio IQCA (Actual)").classes("section-label mb-4")
+                            # Fase 3 (última pasada): la aplicación NO está
+                            # conectada en tiempo real a REMMAQ. La tarjeta ya no
+                            # dice "Promedio IQCA (Actual)" ni promedia el CSV
+                            # completo: refleja la última estimación del usuario.
+                            ui.label("Referencia IQCA orientativa").classes("section-label mb-4")
                             with ui.element("div").classes("relative flex items-center justify-center").style("width: 176px; height: 176px;"):
                                 avg_iqca_progress = ui.circular_progress(
                                     value=0, min=0, max=500, show_value=False,
                                 ).props("size=170px thickness=0.08 color=teal track-color=grey-3")
                                 with ui.column().classes("absolute items-center justify-center gap-0 inset-0"):
                                     avg_iqca_val = ui.label("—").classes("text-5xl font-black leading-none").style("color: var(--ink);")
-                                    avg_iqca_cat = ui.label("SIN DATOS").classes("text-[10px] font-bold tracking-wider mt-1 uppercase").style("color: var(--teal);")
-                            ui.label("Calidad del aire promedio de las estaciones de monitoreo activas.").classes("text-xs mt-5 px-2").style("color: var(--muted);")
+                                    avg_iqca_cat = ui.label("SIN CONSULTA").classes("text-[10px] font-bold tracking-wider mt-1 uppercase").style("color: var(--muted);")
+                            ui.label("Referencia correspondiente a la última estimación realizada por el usuario.").classes("text-xs mt-5 px-2").style("color: var(--muted);")
 
                         # Estado del modelo AI
                         with ui.element("div").classes("dash-status-card w-full"):
@@ -1485,12 +1915,13 @@ def build_app() -> None:
                         with ui.element("div").classes("dash-map-header"):
                             with ui.column().classes("gap-0"):
                                 ui.label("Mapa de Monitoreo · Quito").classes("text-lg font-black").style("color: var(--ink);")
-                                ui.label("Sensores estratégicos en tiempo real").classes("text-xs").style("color: var(--muted);")
-                            with ui.row().classes("gap-3 items-center text-xs").style("color: var(--muted);"):
-                                for color, label_text in [("#10B981", "Bueno"), ("#EAB308", "Acep"), ("#EF4444", "Alerta")]:
-                                    with ui.row().classes("items-center gap-1"):
-                                        ui.element("span").classes("dash-legend-dot").style(f"background: {color};")
-                                        ui.label(label_text)
+                                ui.label("Mapa de referencia — sin mediciones en tiempo real").classes("text-xs").style("color: var(--muted);")
+                            # Fase 4 (última pasada): la leyenda de colores IQCA
+                            # se retira del encabezado — sin coordenadas reales
+                            # los marcadores son neutros y no llevan valor.
+                            with ui.row().classes("gap-2 items-center text-xs").style("color: var(--muted);"):
+                                ui.element("span").classes("dash-legend-dot").style("background: #94A3B8;")
+                                ui.label("Ubicaciones referenciales")
                         map_plot = ui.plotly(fig_mapa_monitoreo(pd.DataFrame(), "PM25")).classes("w-full flex-grow").style("min-height: 0;")
 
             # ---- TRAIN ---- #
@@ -1531,12 +1962,25 @@ def build_app() -> None:
                             ui.label("Configuración del Modelo").classes("model-title")
                             ui.icon("info", color="blue-grey")
 
+                        # Fase 6: el selector visible de contaminante se elimina de la
+                        # UI (el usuario normal ya no lo ve), pero `target_col` sigue
+                        # existiendo en el backend sin cambios: se conserva el mismo
+                        # ui.select (options/.value/.update() siguen funcionando
+                        # exactamente igual para handle_upload/handle_train), solo
+                        # que ahora está oculto. Internamente sigue siendo posible
+                        # llamar las funciones con otro target si se necesita.
+                        target_select = ui.select(
+                            CONTAMINANTES_Y,
+                            value=TARGET_DEFAULT,
+                            label="Target (contaminante)",
+                        ).props("outlined dense")
+                        target_select.visible = False
+
                         with ui.grid(columns=2).classes("w-full gap-4"):
-                            target_select = ui.select(
-                                CONTAMINANTES_Y,
-                                value="PM25",
-                                label="Target (contaminante)",
-                            ).props("outlined dense").classes("w-full")
+                            with ui.column().classes("gap-1 justify-center"):
+                                ui.label("Contaminante de referencia").classes("text-xs text-slate-500 font-bold uppercase tracking-wide")
+                                target_ref_label = ui.label(TARGET_LABEL_AMIGABLE.get(TARGET_DEFAULT, TARGET_DEFAULT)).classes("text-lg font-black text-slate-800")
+                                target_ref_label.tooltip("Esta versión de la interfaz fija el contaminante de referencia; el motor conserva la capacidad de entrenar otros internamente.")
 
                             model_name_input = ui.input(
                                 "Nombre del modelo (.pkl)",
@@ -1571,13 +2015,28 @@ def build_app() -> None:
 
             # ---- METRICS ---- #
             with ui.tab_panel("metrics").classes("p-0"):
-                with ui.grid(columns=3).classes("w-full gap-4 mb-5"):
+                with ui.grid(columns=4).classes("w-full gap-4 mb-5"):
                     with ui.element("div").classes("kpi p-5"):
-                        ui.label("R² Score").classes("kpi-label")
+                        ui.label(f"R² Score — {TARGET_LABEL_AMIGABLE.get(TARGET_DEFAULT, TARGET_DEFAULT)}").classes("kpi-label")
                         kpi_r2 = ui.label("—").classes("kpi-value")
                     with ui.element("div").classes("kpi p-5"):
-                        ui.label("MAE").classes("kpi-label")
+                        # Fase 6 (última pasada): el KPI indica contaminante y
+                        # unidad (p. ej. "MAE — PM2.5" / "0.476 µg/m³"). El valor
+                        # numérico NO se recalcula.
+                        kpi_mae_label = ui.label(
+                            f"MAE — {TARGET_LABEL_AMIGABLE.get(TARGET_DEFAULT, TARGET_DEFAULT)}"
+                        ).classes("kpi-label")
                         kpi_mae = ui.label("—").classes("kpi-value")
+                    with ui.element("div").classes("kpi p-5"):
+                        with ui.row().classes("items-center gap-1"):
+                            ui.label("R² medio CV multipolutante").classes("kpi-label")
+                            kpi_r2medio_info = ui.icon("info", size="14px", color="grey-6")
+                            kpi_r2medio_info.tooltip(
+                                "Promedio descriptivo del R² obtenido para los contaminantes evaluados. "
+                                "No representa un porcentaje de aciertos ni el desempeño de un único modelo multisalida."
+                            )
+                        kpi_r2_medio = ui.label("—").classes("kpi-value")
+                        kpi_contaminantes_eval = ui.label("Contaminantes evaluados: —").classes("text-xs text-slate-500")
                     with ui.element("div").classes("kpi p-5"):
                         ui.label("Estado del sistema").classes("kpi-label")
                         kpi_estado = ui.label("Esperando CSV").classes("kpi-value text-lg")
@@ -1589,8 +2048,7 @@ def build_app() -> None:
                 # Sección de figuras estándar del modelo
                 with ui.grid(columns=2).classes("w-full gap-5 mt-5"):
                     std_figure_specs = [
-                        ("MAE / RMSE", "mae"),
-                        ("Real vs Predicho", "pred"),
+                        ("MAE / RMSE por contaminante", "mae"),
                         ("Curva de Aprendizaje", "lc"),
                         ("R² comparativo", "r2"),
                         ("Feature Importance", "fi"),
@@ -1604,6 +2062,33 @@ def build_app() -> None:
                             img = ui.image().classes("plot-img")
                             img.visible = False
                             figure_images[key] = img
+                            if key == "mae":
+                                # Fase 6 (última pasada)
+                                ui.label(
+                                    "Los errores absolutos no deben compararse directamente entre "
+                                    "contaminantes con diferentes unidades y escalas."
+                                ).classes("text-[11px] text-slate-500 mt-2")
+
+                # ---- Fase 10: Real vs Predicho — tres modos, mismos datos ----
+                pred_modo_uris: dict[str, str | None] = {"pred": None, "pred_paneles": None, "pred_residuo": None}
+                with ui.element("div").classes("card p-5 mt-5 w-full"):
+                    with ui.row().classes("items-center justify-between gap-3 mb-1 flex-wrap"):
+                        ui.label("Real vs Predicho").classes("text-xl font-black text-slate-900")
+                        pred_modo_toggle = ui.toggle(
+                            {"pred": "Superpuesto", "pred_paneles": "Paneles separados", "pred_residuo": "Residuo"},
+                            value="pred",
+                        ).props("no-caps dense unelevated color=teal")
+                    ui.label(
+                        "Mismos datos del modelo original (Real/Predicho del test ciego); solo cambia la forma de visualizarlos. "
+                        "Los datos no se recalculan ni se desplazan entre modos."
+                    ).classes("text-xs text-slate-500 mb-3")
+                    img_pred = ui.image().classes("plot-img")
+                    img_pred.visible = False
+
+                    def _actualizar_imagen_pred():
+                        _set_image(img_pred, pred_modo_uris.get(pred_modo_toggle.value))
+
+                    pred_modo_toggle.on_value_change(lambda _=None: _actualizar_imagen_pred())
 
                 # ---- Sección de Explicabilidad SHAP ----
                 with ui.element("div").classes("card p-5 mt-5 w-full"):
@@ -1624,18 +2109,31 @@ def build_app() -> None:
                             "Activa el checkbox 'Calcular SHAP' en la pestaña de Entrenamiento para generar los gráficos de interpretabilidad."
                         ).classes("text-slate-500 text-sm mb-4")
 
+                    # Fase 11: tarjeta "¿Qué es SHAP?" — solo presentación, el
+                    # cálculo SHAP en sí no se toca.
+                    with ui.element("div").classes("card-flat p-4 mb-4 w-full"):
+                        with ui.row().classes("items-center gap-2 mb-1"):
+                            ui.icon("help_outline", color="teal", size="18px")
+                            ui.label("¿Qué es SHAP?").classes("font-black text-slate-900 text-sm")
+                        ui.label(
+                            "SHAP permite identificar cómo cada característica contribuye a aumentar o disminuir una "
+                            "estimación del modelo. Ayuda a interpretar el comportamiento aprendido por XGBoost, pero "
+                            "no demuestra relaciones causales."
+                        ).classes("text-sm text-slate-600")
+
                     shap_figure_specs = [
-                        ("Importancia Global SHAP (Summary Plot)", "shap_summary"),
-                        ("Distribución de Impacto (Beeswarm Plot)", "shap_beeswarm"),
-                        ("Descomposición de Predicción Individual (Waterfall Plot)", "shap_waterfall"),
+                        ("Importancia Global SHAP (Summary Plot)", "shap_summary", "Indica qué características tienen mayor influencia global en las estimaciones."),
+                        ("Distribución de Impacto (Beeswarm Plot)", "shap_beeswarm", "Muestra dirección, magnitud y distribución del impacto de cada característica."),
+                        ("Descomposición de Predicción Individual (Waterfall Plot)", "shap_waterfall", "Explica cómo las características contribuyeron a una estimación individual."),
                     ]
                     with ui.grid(columns=3).classes("w-full gap-5 mt-2"):
-                        for title, key in shap_figure_specs:
+                        for title, key, explicacion in shap_figure_specs:
                             with ui.element("div").classes("card-flat p-4"):
                                 ui.label(title).classes("font-black text-slate-900 mb-2 text-sm")
                                 img = ui.image().classes("plot-img")
                                 img.visible = False
                                 figure_images[key] = img
+                                ui.label(explicacion).classes("text-xs text-slate-500 mt-2")
 
 
             # ---- PREDICT ---- #
@@ -1643,10 +2141,52 @@ def build_app() -> None:
                 with ui.grid(columns=2).classes("w-full gap-5"):
                     with ui.element("div").classes("card p-5"):
                         ui.label("Panel de predicción").classes("text-xl font-black text-slate-900")
-                        ui.label("Ingresa variables meteorológicas; los lags se imputan automáticamente.").classes("text-slate-500 mb-3")
+                        ui.label("Ingresa variables meteorológicas; los antecedentes históricos y los lags se imputan automáticamente.").classes("text-slate-500 mb-3")
+
+                        _ahora_ec = pd.Timestamp.now(tz=TIMEZONE_APP)
                         with ui.row().classes("w-full gap-3"):
-                            fecha_input = ui.input("Fecha").props("type=date").classes("w-full")
-                            hora_input = ui.input("Hora").props("type=time").classes("w-full")
+                            # Fase 14: selector de fecha real (ui.date en un menú),
+                            # no texto libre.
+                            # Fase 20 (última pasada): cada `ui.menu` se crea DENTRO
+                            # de su propio input. Antes ambos menús colgaban del
+                            # mismo `ui.row`, que actuaba como anchor común de
+                            # Quasar: al pulsar el ícono de hora se abrían a la vez
+                            # el reloj y el calendario. Verificado en navegador.
+                            fecha_input = ui.input("Fecha", value=_ahora_ec.strftime("%Y-%m-%d")).classes("w-full")
+                            with fecha_input:
+                                with fecha_input.add_slot("append"):
+                                    ui.icon("edit_calendar").classes("cursor-pointer").on("click", lambda: fecha_menu.open())
+                                with ui.menu() as fecha_menu:
+                                    ui.date().bind_value(fecha_input)
+
+                            # Selector de hora real (ui.time en un menú SEPARADO
+                            # del de fecha — el ícono de hora no abre un calendario).
+                            hora_input = ui.input("Hora", value=_ahora_ec.strftime("%H:%M")).classes("w-full")
+                            with hora_input:
+                                with hora_input.add_slot("append"):
+                                    ui.icon("schedule").classes("cursor-pointer").on("click", lambda: hora_menu.open())
+                                with ui.menu() as hora_menu:
+                                    ui.time().bind_value(hora_input)
+
+                        with ui.row().classes("items-center gap-1 mt-1"):
+                            ui.icon("info", size="14px", color="grey-6")
+                            ui.label(f"Horizonte operativo de la interfaz: máximo {HORIZONTE_MAX_HORAS} horas.").classes("text-xs text-slate-500")
+                        ui.label(
+                            "El límite reduce extrapolaciones temporales excesivas y está orientado a escenarios "
+                            "meteorológicos de corto plazo (hora America/Guayaquil)."
+                        ).classes("text-[11px] text-slate-400 mb-2")
+
+                        # Fase 17: tarjeta informativa — sin afirmar conexión automática.
+                        with ui.element("div").classes("card-flat p-3 mb-1"):
+                            with ui.row().classes("items-center gap-2 mb-1"):
+                                ui.icon("cloud", size="16px", color="blue-grey")
+                                ui.label("Datos meteorológicos").classes("text-xs font-black text-slate-700")
+                            ui.label(
+                                "Para una estimación futura, ingresa temperatura, humedad, velocidad y dirección del "
+                                "viento y precipitación obtenidas de una fuente meteorológica externa confiable, por "
+                                "ejemplo INAMHI."
+                            ).classes("text-[11px] text-slate-500")
+
                         temp_input = ui.slider(min=-10, max=40, step=0.1, value=18).props("label label-always").classes("w-full mt-4")
                         ui.label("Temperatura (°C)").classes("text-xs text-slate-500")
                         hum_input = ui.slider(min=0, max=100, step=1, value=70).props("label label-always").classes("w-full mt-4")
@@ -1669,7 +2209,7 @@ def build_app() -> None:
                             result_category = ui.label("Sin predicción").classes(
                                 "text-4xl font-black text-slate-700 mt-4"
                             )
-                            result_iqca = ui.label("IQCA: — / 500").classes(
+                            result_iqca = ui.label("Referencia IQCA orientativa: — / 500").classes(
                                 "text-2xl font-bold text-slate-700"
                             )
                             with ui.element("div").classes("result-band w-full my-4"):
@@ -1702,30 +2242,26 @@ def build_app() -> None:
 
                 if ts_col:
                     df_map = df_raw.copy()
-                    df_map[ts_col] = pd.to_datetime(df_map[ts_col], infer_datetime_format=True, errors="coerce")
+                    df_map[ts_col] = pd.to_datetime(df_map[ts_col], errors="coerce")
                     df_map = df_map.dropna(subset=[ts_col]).set_index(ts_col).sort_index()
                 else:
                     df_map = df_raw
 
                 target_for_map = target_select.value or "PM25"
-                map_plot.update_figure(fig_mapa_monitoreo(df_map, target_for_map))
+                map_plot.update_figure(fig_mapa_monitoreo(df_map, target_for_map, origen=filename))
 
-                # Actualizar gauge IQCA promedio
-                if target_for_map in df_raw.columns:
-                    mean_val = float(df_raw[target_for_map].dropna().mean())
-                    iq = calcular_iqca(target_for_map, mean_val)
-                    if iq is not None:
-                        avg_iqca_val.text = f"{iq:.0f}"
-                        cat_label, color_cat = categoria_iqca(iq)
-                        avg_iqca_cat.text = cat_label.upper()
-                        avg_iqca_cat.style(f"color: {color_cat};")
-                        avg_iqca_progress.set_value(iq)
+                # Fase 3 (última pasada): el gauge YA NO se calcula con el
+                # promedio completo del CSV (eso sugería monitoreo en tiempo
+                # real). Solo se actualiza tras una predicción del usuario, en
+                # handle_predict, con el mismo IQCA orientativo de
+                # predecir_detalle().
             except Exception:
                 map_plot.update_figure(fig_mapa_monitoreo(pd.DataFrame(), "PM25"))
             targets = summary.get("targets", CONTAMINANTES_Y.copy())
             target_select.options = targets
-            target_select.value = targets[0]
+            target_select.value = TARGET_DEFAULT if TARGET_DEFAULT in targets else targets[0]
             target_select.update()
+            target_ref_label.text = TARGET_LABEL_AMIGABLE.get(target_select.value, target_select.value)
             if summary.get("ok"):
                 csv_name.text = summary["name"]
                 csv_shape.text = f"Filas: {summary['rows']:,} · Columnas: {summary['cols']}"
@@ -1748,9 +2284,13 @@ def build_app() -> None:
     upload.on_upload(handle_upload)
 
     async def handle_train():
+        if state.get("training"):
+            ui.notify("Ya existe un entrenamiento en curso.", type="warning")
+            return
         if not state.get("csv_path"):
             ui.notify("Sube un CSV antes de entrenar", type="warning")
             return
+        state["training"] = True
         train_btn.disable()
         train_spinner.visible = True
         train_status.text = "Procesando modelo… ⏳"
@@ -1768,10 +2308,21 @@ def build_app() -> None:
                 log_box.text = result.get("logs") or "Sin logs"
                 kpi_r2.text = result["kpis"].get("r2", "—")
                 kpi_mae.text = result["kpis"].get("mae", "—")
+                kpi_mae_label.text = result["kpis"].get("mae_label", "MAE")
                 kpi_estado.text = result["kpis"].get("estado", "—")
+                kpi_r2_medio.text = result["kpis"].get("r2_cv_medio", "—")
+                kpi_contaminantes_eval.text = f"Contaminantes evaluados: {result['kpis'].get('n_contaminantes_evaluados', '—')}/{result['kpis'].get('n_contaminantes_total', len(CONTAMINANTES_Y))}"
                 train_status.text = "Modelo listo 🚀" if result.get("ok") else "Entrenamiento con error"
                 for key, img in figure_images.items():
                     _set_image(img, result.get("figures", {}).get(key))
+                # Fase 10: los tres modos de Real vs Predicho comparten el
+                # mismo toggle; se guardan las 3 URIs y se muestra la que
+                # esté seleccionada actualmente.
+                figs_result = result.get("figures", {})
+                pred_modo_uris["pred"] = figs_result.get("pred")
+                pred_modo_uris["pred_paneles"] = figs_result.get("pred_paneles")
+                pred_modo_uris["pred_residuo"] = figs_result.get("pred_residuo")
+                _actualizar_imagen_pred()
 
                 # Actualizar card "Estado del Modelo AI"
                 if result.get("ok"):
@@ -1785,6 +2336,7 @@ def build_app() -> None:
                 # El modelo y resultados están correctamente guardados en disco.
                 log.warning("Cliente desconectado durante entrenamiento; UI no actualizada: %s", e_ui)
         finally:
+            state["training"] = False
             try:
                 train_spinner.visible = False
                 train_btn.enable()
@@ -1848,7 +2400,8 @@ def build_app() -> None:
             result_category.set_text(categoria)
             result_category.style(replace=f"color: {color};")
             result_iqca.set_text(
-                f"IQCA: {iqca:.1f} / 500" if iqca is not None else "IQCA: — / 500"
+                f"Referencia IQCA orientativa: {iqca:.1f} / 500"
+                if iqca is not None else "Referencia IQCA orientativa: — / 500"
             )
             iqca_pointer.style(
                 replace=(
@@ -1863,6 +2416,27 @@ def build_app() -> None:
             result_iqca.update()
             iqca_pointer.update()
             result_md.update()
+
+            # Fase 3 (última pasada): el gauge del dashboard refleja EXACTAMENTE
+            # el mismo IQCA orientativo devuelto por predecir_detalle(); nunca el
+            # promedio del CSV completo. Si la consulta no es válida se conserva
+            # el estado anterior.
+            try:
+                if result.get("ok"):
+                    if iqca is not None:
+                        avg_iqca_val.text = f"{iqca:.0f}"
+                        avg_iqca_cat.text = str(categoria).upper()
+                        avg_iqca_cat.style(replace=f"color: {color};")
+                        avg_iqca_progress.set_value(iqca)
+                    else:
+                        avg_iqca_val.text = "—"
+                        avg_iqca_cat.text = "NO CALCULABLE"
+                        avg_iqca_cat.style(replace="color: #6B7280;")
+                        avg_iqca_progress.set_value(0)
+                    avg_iqca_val.update()
+                    avg_iqca_cat.update()
+            except RuntimeError:
+                pass  # cliente desconectado; el resultado ya está en la pestaña
 
             if not result.get("ok"):
                 ui.notify("Revisa los datos ingresados", type="warning")
